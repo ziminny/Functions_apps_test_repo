@@ -1,19 +1,112 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
-
 trigger:
-- main
+  branches:
+    include: 
+    - main
 
 pool:
+  name: Azure Pipelines Vagner Test
   vmImage: ubuntu-latest
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+stages:
+- stage: Build
+  displayName: Build stage
+  jobs:
+  - job: packageBuild
+    displayName: Package Build
+    steps:
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+    - task: NodeTool@0
+      displayName: Install Node
+      inputs:
+        versionSpec: 20.x
+        displayName: Install Node.js
+
+    - script: |
+        if [ -f extensions.csproj ]
+        then
+          dotnet build extensions.csproj --runtime ubuntu.24.04-x64 --output ./bin
+        fi
+      displayName: Build extensions
+
+    - task: AzureCLI@2
+      displayName: Prepare Database Firewall
+      name: addRule
+      condition: succeeded()
+      inputs:
+        azureSubscription: PasseiOAB
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          PUB_IP=$(curl https://ipecho.net/plain ; echo)
+          az mysql flexible-server firewall-rule create \
+          --name $(echo $(DATABASE_URL) | cut -d "." -f1) \
+          --resource-group $(RESOURCE_GROUP) \
+          --end-ip-address $PUB_IP \
+          --rule-name "tempRule" \
+          --start-ip-address $PUB_IP
+        env:
+        RESOURCE_GROUP: $(RESOURCE_GROUP)
+
+    - script: |
+        npx --yes husky
+        npm build
+        npm start
+      displayName: Prepare binaries
+      name: nodeBuild
+
+    - task: AzureCLI@2
+      displayName: Remove Database Firewall
+      condition: succeededOrFailed()
+      inputs:
+        azureSubscription: 'PasseiOAB'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az mysql flexible-server firewall-rule delete \
+          --name $(echo $(DATABASE_URL) | cut -d "." -f1) \
+          --resource-group $(RESOURCE_GROUP) \
+          --rule-name "tempRule" \
+          --yes
+        env:
+        RESOURCE_GROUP: $(RESOURCE_GROUP)
+
+    - task: ArchiveFiles@2
+      displayName: Archive files
+      inputs:
+        rootFolderOrFile: $(System.DefaultWorkingDirectory)
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+        replaceExistingArchive: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: Upload Package
+      inputs:
+        PathtoPublish: $(Build.ArtifactStagingDirectory)
+        ArtifactName: drop
+        publishLocation: Container
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: backendDeployment
+    displayName: Deploy to Function App
+    steps:
+    - task: DownloadPipelineArtifact@2
+      displayName: Download Package
+      inputs:
+        buildType: current
+        buildVersionToDownload: latest
+        artifactName: drop
+        targetPath: $(Pipeline.Workspace)
+
+
+    - task: AzureFunctionApp@2
+      displayName: Azure Functions App Deploy
+      inputs:
+        azureSubscription: PasseiOAB
+        appType: functionAppLinux
+        appName: fapasseioabdev
+        package: $(Pipeline.Workspace)/$(Build.BuildId).zip
